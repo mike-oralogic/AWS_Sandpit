@@ -5,10 +5,25 @@ glue_database_name = "lakehouse"
 # Sandbox convenience: lets `terraform destroy` empty the bucket.
 force_destroy_bucket = true
 
-# Phase 2 values are written automatically by `snowflake/setup_snowflake.py bootstrap`
-# into snowflake.auto.tfvars.json. To set them by hand instead:
-# snowflake_iam_user_arns = ["arn:aws:iam::123456789012:user/abc1-s-v2st1234"]
-# snowflake_external_ids  = ["ABC12345_SFCRole=2_xxxxxxxx=", "ABC12345_SFCRole=2_yyyyyyyy="]
+# --- Snowflake ---------------------------------------------------------------
+# Auth comes from SNOWFLAKE_* environment variables or ~/.snowflake/config.
+snowflake_admin_role     = "ACCOUNTADMIN"
+snowflake_warehouse_size = "XSMALL"
+snowflake_role_users     = [] # e.g. ["JANE_DOE"]
+snowflake_share_accounts = [] # e.g. ["MYORG.CONSUMER_ACCOUNT"]
+
+# snowflake_names = {
+#   linked_database = "GLUE_LAKEHOUSE"
+#   warehouse       = "ICEBERG_WH"
+# }
+
+# --- Glue job, Data Quality, alerts ------------------------------------------
+glue_job_schedule    = null # e.g. "cron(0 * * * ? *)" for hourly
+dq_fail_job_on_error = true
+alert_email          = null # e.g. "data-alerts@example.com" (confirm the SNS email)
+
+# --- Consumers ------------------------------------------------------------------
+enable_emr_serverless = false
 
 tags = {
   Owner = "data-platform"

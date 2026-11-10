@@ -1,98 +1,111 @@
-# AWS Sandpit — Apache Iceberg lakehouse on S3 + Glue, queried from Snowflake
+# AWS Sandpit — Apache Iceberg lakehouse on S3 + Glue with Snowflake
 
-A working Apache Iceberg setup:
-
-- **Amazon S3** holds the Iceberg data and metadata (Parquet + JSON/Avro), encrypted with KMS.
-- **AWS Glue Data Catalog** is the Iceberg catalog. Tables are written by PyIceberg and by a Glue Spark job.
-- **Snowflake** reads *and writes* the same tables through Glue's Iceberg REST endpoint, and can also
-  hold its own Snowflake-managed Iceberg tables in the same bucket.
+Terraform for an Apache Iceberg lakehouse where AWS Glue is the catalog, Amazon S3 holds the data, and
+Snowflake, Athena and EMR all read (and Snowflake also writes) the same tables. **AWS and Snowflake are
+created together in a single `terraform apply`.**
 
 ```
-PyIceberg / Glue Spark ──writes──▶ Glue Data Catalog (db: lakehouse) ──points to──▶ S3 bucket (SSE-KMS)
-                                          ▲                                              ▲
-                                Iceberg REST + SigV4                               external volume
-                                          │                                              │
-                                          └────── IAM role <project>-snowflake ──────────┘
-                                                              ▲
-                                                          Snowflake
-                                        • GLUE_LAKEHOUSE  — catalog-linked DB (Glue tables, read/write)
-                                        • ICEBERG_MANAGED — Snowflake-managed Iceberg tables in the same bucket
+Glue ETL job (DQ gate, MERGE, maintenance) ─┐
+PyIceberg sample loader ────────────────────┼─▶ Glue Data Catalog (db: lakehouse) ──▶ S3 (SSE-KMS, Iceberg)
+                                            │          ▲   ▲   ▲                           ▲
+  Glue Data Quality rulesets ───────────────┘          │   │   └── Athena workgroup ───────┤
+  CloudWatch logs / alarms / dashboard ─ SNS           │   └────── EMR Serverless ─────────┤
+                                                       │                                   │
+                                Iceberg REST + SigV4 ──┘── IAM role <project>-snowflake ──┴── external volume
+                                                                 ▲
+                                                             Snowflake
+                          catalog integration · GLUE_LAKEHOUSE (catalog-linked DB, read/write)
+                          ICEBERG_MANAGED.ANALYTICS.DAILY_REVENUE (Snowflake-managed Iceberg)
+                          ICEBERG_WH warehouse · ICEBERG_ENGINEER role · ICEBERG_ANALYTICS_SHARE
 ```
 
-## Layout
+## How it maps to the reference architecture
 
-| Path | What it is |
-|------|------------|
-| `terraform/` | S3 bucket, KMS key, Glue database, IAM role for Snowflake, optional Glue 5.0 Spark job |
-| `snowflake/0*.sql` | External volume, catalog integration, verification, databases/tables, example queries |
-| `snowflake/setup_snowflake.py` | Fills the SQL from `terraform output`, runs it, and writes Snowflake's trust values back for Terraform |
-| `ingest/load_sample_data.py` | PyIceberg: creates `customers` and `orders` (partitioned by day) in Glue and loads sample rows |
-| `ingest/glue_job/iceberg_etl.py` | Glue Spark job: `MERGE` into `orders_enriched`, then compaction + snapshot expiry |
-| `Makefile` | Runs the whole thing in order |
+| Diagram | Implemented as | File |
+|---|---|---|
+| 1 · AWS Glue ETL | Glue 5.0 Spark job: Data Quality gate → `MERGE` into `orders_enriched` → compaction + snapshot expiry; optional schedule | `terraform/glue_job.tf`, `ingest/glue_job/iceberg_etl.py` |
+| 2 · Glue Data Catalog | Glue database `lakehouse` (Iceberg namespace) | `terraform/glue.tf` |
+| 2 · Glue Data Quality | DQDL rulesets for `orders` and `customers`, evaluated by the job, results published to the Glue DQ console and CloudWatch | `terraform/data_quality.tf` |
+| 2 · Observability | Log group with retention, Glue job metrics + observability metrics + job insights, EventBridge job-failure alerts, DQ alarms, SNS topic (optional email), CloudWatch dashboard | `terraform/observability.tf` |
+| 2 · Amazon S3 | KMS-encrypted, versioned, TLS-only bucket | `terraform/s3.tf` |
+| Consumers · Athena | Engine v3 workgroup with KMS results, scan limit, saved queries (incl. time travel, snapshots, `OPTIMIZE`), read-only IAM policy for users | `terraform/athena.tf` |
+| Consumers · EMR | EMR Serverless Spark app (optional, auto-stop) + runtime role + report job | `terraform/emr.tf`, `ingest/emr/iceberg_report.py` |
+| 3 · Catalog Integration | `snowflake_catalog_integration_iceberg_rest` against Glue's Iceberg REST endpoint, SigV4 | `terraform/snowflake.tf` |
+| External Volume | `snowflake_external_volume` on the bucket, SSE-KMS | `terraform/snowflake.tf` |
+| 4 · Iceberg Tables | Catalog-linked database `GLUE_LAKEHOUSE` (all Glue tables, auto-synced, writable) + Snowflake-managed Iceberg table | `terraform/snowflake_objects.tf` |
+| 5 · Warehouses | `ICEBERG_WH` (auto-suspend) and `ICEBERG_ENGINEER` role with grants | `terraform/snowflake_objects.tf` |
+| 5 · Shares | `ICEBERG_ANALYTICS_SHARE` with the managed Iceberg table; consumer accounts via variable | `terraform/snowflake_objects.tf` |
+
+**Not yet implemented** (next phase): Sources, Glue Crawler, Glue Connectors and Glue Streaming, which
+need real source systems; QuickSight and SageMaker, which read from Snowflake.
+
+### Single apply, no handshake
+
+Snowflake normally needs a two-step setup: create the external volume / catalog integration, read the IAM
+user and external ID Snowflake reports, then put them in the IAM role's trust policy. Here:
+
+- the IAM role ARN is built from its name, so Snowflake objects can reference it before it exists;
+- the external ID is generated by Terraform (`random_uuid`) and set on both Snowflake objects;
+- the trust policy reads Snowflake's IAM user ARN from the external volume's `describe_output` and from
+  `DESC CATALOG INTEGRATION`;
+- objects that use the role straight away (linked database, managed table) wait 30 s for IAM propagation.
 
 ## Prerequisites
 
 - Terraform ≥ 1.6, Python ≥ 3.10, AWS CLI.
-- AWS credentials allowed to create S3, KMS, IAM, Glue resources.
-- A Snowflake account **in the same AWS region** (cross-region works but costs egress), and a user
-  with `ACCOUNTADMIN` (or rights to create external volumes, integrations and databases) plus a warehouse.
-- If your AWS account has Lake Formation enforcing permissions on the Glue catalog (i.e. you removed the
-  default `IAMAllowedPrincipals` grants), also grant the `<project>-snowflake` and `<project>-glue-job`
-  roles Lake Formation permissions on the `lakehouse` database. Out of the box, IAM permissions are enough.
+- AWS credentials allowed to create S3, KMS, IAM, Glue, Athena, CloudWatch, EventBridge, SNS and EMR Serverless resources.
+- A Snowflake account **in the same AWS region** and a user with `ACCOUNTADMIN` (or a role that can create
+  external volumes, integrations, databases, warehouses, roles and shares). Terraform reads Snowflake
+  credentials from the environment, for example:
+
+  ```bash
+  export SNOWFLAKE_ORGANIZATION_NAME=myorg SNOWFLAKE_ACCOUNT_NAME=myaccount SNOWFLAKE_USER=terraform
+  ```
+
+  ```bash
+  export SNOWFLAKE_AUTHENTICATOR=SNOWFLAKE_JWT SNOWFLAKE_PRIVATE_KEY="$(cat ~/.ssh/snowflake_tf.p8)"
+  ```
+
+  or set `SNOWFLAKE_PROFILE` to a profile in `~/.snowflake/config`.
+- If Lake Formation enforces permissions on your Glue catalog (default `IAMAllowedPrincipals` grants
+  removed), also grant the Snowflake, Glue-job, EMR and Athena principals Lake Formation permissions on
+  the `lakehouse` database. Out of the box, IAM permissions are enough.
 
 ## Build it
 
 ```bash
-cp terraform/terraform.tfvars.example terraform/terraform.tfvars   # set aws_region etc.
+cp terraform/terraform.tfvars.example terraform/terraform.tfvars   # region, alert email, share accounts...
 ```
-
-```bash
-export SNOWFLAKE_CONNECTION=my_conn   # a name in ~/.snowflake/connections.toml
-```
-
-(or set `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER` and one of `SNOWFLAKE_PASSWORD` /
-`SNOWFLAKE_PRIVATE_KEY_FILE` / `SNOWFLAKE_AUTHENTICATOR=externalbrowser`; set `SNOWFLAKE_WAREHOUSE` if
-yours isn't `COMPUTE_WH`.)
 
 ```bash
 make all
 ```
 
-That runs the steps below; you can also run them one by one.
-
 | Step | Command | What happens |
-|------|---------|--------------|
-| 1 | `make venv` | Python virtualenv with the Snowflake connector and PyIceberg |
-| 2 | `make aws` | **Phase 1** apply: bucket, KMS, Glue DB, IAM role (trust policy is a locked placeholder), Glue job |
-| 3 | `make snowflake` | Creates the external volume and Glue REST catalog integration, reads `DESC` output, writes `terraform/snowflake.auto.tfvars.json` |
-| 4 | `make trust` | **Phase 2** apply: role now trusts Snowflake's IAM user with both external IDs |
-| 5 | `make verify` | `SYSTEM$VERIFY_EXTERNAL_VOLUME`, `SYSTEM$VERIFY_CATALOG_INTEGRATION`, list namespaces |
-| 6 | `make load` | PyIceberg creates and fills `lakehouse.customers` and `lakehouse.orders` in Glue |
-| 7 | `make objects` | `ICEBERG_ENGINEER` role, catalog-linked database `GLUE_LAKEHOUSE`, managed table `ICEBERG_MANAGED.ANALYTICS.DAILY_REVENUE` |
-| 8 | `make queries` | Reads Glue tables, inserts a row back into Glue from Snowflake, rolls up into the managed table |
-| — | `make glue-job` | Optional: runs the Glue Spark job (`MERGE` + maintenance) |
+|---|---|---|
+| 1 | `make venv` | Virtualenv with PyIceberg |
+| 2 | `make apply` | Everything in AWS and Snowflake |
+| 3 | `make load` | PyIceberg creates `lakehouse.customers` and `lakehouse.orders` (partitioned by day) and loads sample rows. They appear in Snowflake's `GLUE_LAKEHOUSE` within ~30 s |
+| 4 | `make glue-job` | DQ gate, `MERGE` into `orders_enriched`, maintenance. Watch the dashboard (`terraform output dashboard_url`) |
+| — | `make emr-job` | With `enable_emr_serverless = true`: Spark report on EMR Serverless |
 
-Why two Terraform applies? Snowflake only reveals the IAM user and external IDs it will use *after* the
-external volume and catalog integration exist, and those need the role ARN first. Phase 1 creates the
-role with a trust policy nobody can satisfy; phase 2 swaps in the real values.
-
-To run the SQL by hand instead, print any file with the placeholders filled:
-
-```bash
-.venv/bin/python snowflake/setup_snowflake.py render 02_catalog_integration.sql
-```
+Then run `snowflake/example_queries.sql` in Snowflake and the saved queries in the Athena workgroup.
 
 ## Things to know
 
-- **Names:** tables created outside Snowflake are lowercase, so quote them in Snowflake:
-  `GLUE_LAKEHOUSE."lakehouse"."orders"`.
-- **Timestamps:** the sample uses zone-less `timestamp` (Iceberg) → `TIMESTAMP_NTZ(6)` (Snowflake).
-- **Read-only Snowflake:** set `allow_snowflake_writes = false` in Terraform and `ALLOW_WRITES = FALSE`
-  on the external volume.
-- **Maintenance:** Glue-managed tables need compaction and snapshot expiry. The Glue job does it, or
-  turn on Glue's automatic table optimizers. Snowflake maintains its own managed tables.
-- **Costs:** S3 storage + requests, KMS requests (reduced by S3 Bucket Keys), Glue catalog requests, Glue
-  job DPU-hours when run, and Snowflake warehouse credits.
+- **Snowflake provider:** needs `snowflakedb/snowflake` 2.x. `snowflake_iceberg_table` and `snowflake_share`
+  are preview resources and are enabled in `versions.tf`. The catalog-linked database and adding share
+  consumers use `snowflake_execute` (raw SQL) because the provider has no resource for them yet.
+- **Sharing Iceberg tables:** the share grants `SELECT` on the Snowflake-managed Iceberg table. Snowflake
+  supports sharing Snowflake-managed Iceberg tables; Glue-managed tables in the linked database are not shared.
+- **Data Quality gate:** with `dq_fail_job_on_error = true` the job stops before writing when any rule
+  fails; the `RulesFailed` alarm fires either way. Edit the DQDL in `terraform/data_quality.tf`.
+- **Names:** tables created outside Snowflake are lowercase, so quote them: `GLUE_LAKEHOUSE."lakehouse"."orders"`.
+- **Athena:** the `athena_user` policy is read-only; the `OPTIMIZE` saved query needs write access
+  (`s3:PutObject`/`DeleteObject`, `glue:UpdateTable`).
+- **Read-only Snowflake:** set `allow_snowflake_writes = false`.
+- **Costs:** S3, KMS requests (reduced by S3 Bucket Keys), Glue catalog requests, Glue DPU-hours per job
+  run, Athena per TB scanned, EMR Serverless only while running, Snowflake credits while the warehouse runs.
 
 ## Tear down
 
@@ -100,5 +113,4 @@ To run the SQL by hand instead, print any file with the placeholders filled:
 make destroy
 ```
 
-This drops the Snowflake objects, then runs `terraform destroy`. The bucket must be empty unless
-`force_destroy_bucket = true`. The KMS key is scheduled for deletion after 7 days.
+The bucket must be empty unless `force_destroy_bucket = true`. The KMS key is scheduled for deletion after 7 days.

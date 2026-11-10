@@ -3,7 +3,6 @@ terraform/.terraform/
 terraform/*.tfstate
 terraform/*.tfstate.*
 terraform/terraform.tfvars
-terraform/snowflake.auto.tfvars.json
 terraform/*.tfplan
 
 # Python
