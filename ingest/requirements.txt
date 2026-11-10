@@ -1,0 +1,1 @@
+pyiceberg[glue,pyarrow,pyiceberg-core]>=0.10

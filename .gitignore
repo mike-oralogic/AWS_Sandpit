@@ -1,0 +1,14 @@
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/terraform.tfvars
+terraform/snowflake.auto.tfvars.json
+terraform/*.tfplan
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+.DS_Store

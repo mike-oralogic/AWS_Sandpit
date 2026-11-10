@@ -1,0 +1,15 @@
+project            = "iceberg-lakehouse"
+aws_region         = "us-east-1" # match your Snowflake account's region
+glue_database_name = "lakehouse"
+
+# Sandbox convenience: lets `terraform destroy` empty the bucket.
+force_destroy_bucket = true
+
+# Phase 2 values are written automatically by `snowflake/setup_snowflake.py bootstrap`
+# into snowflake.auto.tfvars.json. To set them by hand instead:
+# snowflake_iam_user_arns = ["arn:aws:iam::123456789012:user/abc1-s-v2st1234"]
+# snowflake_external_ids  = ["ABC12345_SFCRole=2_xxxxxxxx=", "ABC12345_SFCRole=2_yyyyyyyy="]
+
+tags = {
+  Owner = "data-platform"
+}
